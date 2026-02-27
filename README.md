@@ -59,7 +59,7 @@ source install/setup.bash
 Use this command to run your solution to the coursework:
 
 ```bash
-cd ros2_ws
+cd ~/comp0250_S26_labs
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 export PATH=/usr/bin:$PATH
