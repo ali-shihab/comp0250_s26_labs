@@ -301,7 +301,7 @@ Shell 2 (play benchmark bag):
    source /opt/ros/humble/setup.bash
    source /home/ziwen/ros2_humble_perception_pipeline/ros2_pp_ws/install/setup.bash
    ros2 bag play -r 1 \
-     ..path..to../moveit_benchmark_resources/moveit_benchmark_resources/bag_files/depth_camera_bag/depth_camera_datas.mcap \
+      /cs/student/msc/rai/comp0250/ws_moveit2/src/moveit_benchmark_resources/moveit_benchmark_resources/bag_files/depth_camera_bag/depth_camera_datas.mcap \
      --loop
 
 Headless option:
