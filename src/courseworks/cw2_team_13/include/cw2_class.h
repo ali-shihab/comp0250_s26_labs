@@ -58,7 +58,8 @@ public:
 
   // ── Task 1 helpers ───────────────────────────────────────────────────────
   bool t1_pickAndPlace(const geometry_msgs::msg::Point & obj,
-                       const geometry_msgs::msg::Point & goal);
+                       const geometry_msgs::msg::Point & goal,
+                       const std::string & shape_type);
   bool openGripper();
   bool closeGripper(double width);
   bool moveArmToPose(const geometry_msgs::msg::Pose & target_pose,
