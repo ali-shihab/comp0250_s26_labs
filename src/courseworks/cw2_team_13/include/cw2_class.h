@@ -43,7 +43,7 @@ class cw2
 public:
   explicit cw2(const rclcpp::Node::SharedPtr &node);
 
-  // ── ROS service callbacks ────────────────────────────────────────────────
+  // Service callbacks.
   void t1_callback(
     const std::shared_ptr<cw2_world_spawner::srv::Task1Service::Request> request,
     std::shared_ptr<cw2_world_spawner::srv::Task1Service::Response> response);
@@ -56,7 +56,7 @@ public:
 
   void cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
 
-  // ── Task 1 helpers ───────────────────────────────────────────────────────
+  // Task 1.
   bool t1_pickAndPlace(const geometry_msgs::msg::Point & obj,
                        const geometry_msgs::msg::Point & goal,
                        const std::string & shape_type);
@@ -72,7 +72,14 @@ public:
                                            double yaw = 0.0);
   void addGroundCollision();
 
-  // ── ROS handles ─────────────────────────────────────────────────────────
+  // Estimates the shape's yaw (folded into [-pi/4, pi/4] since both shapes
+  // are C4-symmetric) and arm-width (snapped to {0.020, 0.030, 0.040} m)
+  // from the latest point cloud, filtering around obj_xy.
+  bool detectShapePose(const geometry_msgs::msg::Point & obj_xy,
+                       const std::string & shape_type,
+                       double & out_yaw,
+                       double & out_size);
+
   rclcpp::Node::SharedPtr node_;
   rclcpp::Service<cw2_world_spawner::srv::Task1Service>::SharedPtr t1_service_;
   rclcpp::Service<cw2_world_spawner::srv::Task2Service>::SharedPtr t2_service_;
