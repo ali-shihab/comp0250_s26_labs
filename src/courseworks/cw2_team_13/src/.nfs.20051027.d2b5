@@ -211,54 +211,54 @@ bool cw2::t1_pickAndPlace(
     place_x, place_y, place_ee_z, safe_z, GRASP_YAW);
 
   // ── Step 1: open gripper ─────────────────────────────────────────────
-  if (!openGripper()) return false;
+  if (\!openGripper()) return false;
 
   // ── Step 2: joint-space move HIGH above grasp point (safe altitude) ──
   // The arm can swing freely here — safe_z > shape top + 30cm — so joint
   // planning cannot collide with the object.
-  if (!moveArmToPose(
+  if (\!moveArmToPose(
       makeTopDownPose(grasp_x, grasp_y, safe_z, GRASP_YAW),
       "safe-above-object")) return false;
 
   // ── Step 3: Cartesian vertical descent to pre-grasp clearance height ─
-  if (!moveArmCartesian(
+  if (\!moveArmCartesian(
       {makeTopDownPose(grasp_x, grasp_y, pre_grasp_z, GRASP_YAW)},
       0.005, 0.0, /*allow_fallback=*/false)) return false;
 
   // ── Step 4: Cartesian vertical descent to grasp height ───────────────
-  if (!moveArmCartesian(
+  if (\!moveArmCartesian(
       {makeTopDownPose(grasp_x, grasp_y, grasp_ee_z, GRASP_YAW)},
       0.005, 0.0, /*allow_fallback=*/false)) return false;
 
   // ── Step 5: close gripper onto arm ───────────────────────────────────
-  if (!closeGripper(GRASP_WIDTH)) return false;
+  if (\!closeGripper(GRASP_WIDTH)) return false;
 
   // ── Step 6: Cartesian vertical lift to safe altitude ─────────────────
   // Lift the shape straight up before any lateral motion, so the fingers
   // and shape clear the workspace cleanly.
-  if (!moveArmCartesian(
+  if (\!moveArmCartesian(
       {makeTopDownPose(grasp_x, grasp_y, safe_z, GRASP_YAW)},
       0.005, 0.0, /*allow_fallback=*/false)) return false;
 
   // ── Step 7: joint-space lateral move to safe altitude above basket ──
   // At safe_z the carried shape's bottom is > 25 cm above the basket walls,
   // so any joint-space trajectory is safe.
-  if (!moveArmToPose(
+  if (\!moveArmToPose(
       makeTopDownPose(place_x, place_y, safe_z, GRASP_YAW),
       "safe-above-basket")) return false;
 
   // ── Step 8: Cartesian vertical descent into basket ──────────────────
-  if (!moveArmCartesian(
+  if (\!moveArmCartesian(
       {makeTopDownPose(place_x, place_y, place_ee_z, GRASP_YAW)},
       0.005, 0.0, /*allow_fallback=*/false)) return false;
 
   // ── Step 9: open gripper — release shape ─────────────────────────────
-  if (!openGripper()) return false;
+  if (\!openGripper()) return false;
 
   // ── Step 10: Cartesian vertical retreat to safe altitude ─────────────
   // Pull the open gripper straight back up so its fingers do not knock
   // the just-placed shape or the basket walls on the way out.
-  if (!moveArmCartesian(
+  if (\!moveArmCartesian(
       {makeTopDownPose(place_x, place_y, safe_z, GRASP_YAW)},
       0.005, 0.0, /*allow_fallback=*/false)) {
     RCLCPP_WARN(node_->get_logger(),
@@ -276,7 +276,7 @@ bool cw2::openGripper()
 {
   hand_group_->setNamedTarget("open");
   auto result = hand_group_->move();
-  if (result != moveit::core::MoveItErrorCode::SUCCESS) {
+  if (result \!= moveit::core::MoveItErrorCode::SUCCESS) {
     RCLCPP_ERROR(node_->get_logger(),
       "openGripper failed (code %d)", static_cast<int>(result.val));
     return false;
@@ -293,7 +293,7 @@ bool cw2::closeGripper(double width)
   hand_group_->setJointValueTarget(targets);
 
   auto result = hand_group_->move();
-  if (result != moveit::core::MoveItErrorCode::SUCCESS) {
+  if (result \!= moveit::core::MoveItErrorCode::SUCCESS) {
     // Contact-stop is expected when the fingers meet the object before
     // reaching the commanded width. Log a warning and continue.
     RCLCPP_WARN(node_->get_logger(),
@@ -315,7 +315,7 @@ bool cw2::moveArmToPose(
 
   moveit::planning_interface::MoveGroupInterface::Plan plan;
   auto plan_rc = arm_group_->plan(plan);
-  if (plan_rc != moveit::core::MoveItErrorCode::SUCCESS) {
+  if (plan_rc \!= moveit::core::MoveItErrorCode::SUCCESS) {
     RCLCPP_ERROR(node_->get_logger(),
       "moveArmToPose [%s]: planning failed (code %d)",
       description.c_str(), static_cast<int>(plan_rc.val));
@@ -325,7 +325,7 @@ bool cw2::moveArmToPose(
 
   auto exec_rc = arm_group_->execute(plan);
   arm_group_->clearPoseTargets();
-  if (exec_rc != moveit::core::MoveItErrorCode::SUCCESS) {
+  if (exec_rc \!= moveit::core::MoveItErrorCode::SUCCESS) {
     RCLCPP_ERROR(node_->get_logger(),
       "moveArmToPose [%s]: execution failed (code %d)",
       description.c_str(), static_cast<int>(exec_rc.val));
@@ -367,7 +367,7 @@ bool cw2::moveArmCartesian(
   moveit::planning_interface::MoveGroupInterface::Plan plan;
   plan.trajectory_ = trajectory;
   auto exec_rc = arm_group_->execute(plan);
-  if (exec_rc != moveit::core::MoveItErrorCode::SUCCESS) {
+  if (exec_rc \!= moveit::core::MoveItErrorCode::SUCCESS) {
     RCLCPP_ERROR(node_->get_logger(),
       "moveArmCartesian: execution failed (code %d)",
       static_cast<int>(exec_rc.val));

@@ -249,17 +249,24 @@ class WorldSpawner(object):
     return self.get_model_state_via_gz(name)
 
   def get_model_state_via_gz(self, name):
-    try:
-      output = subprocess.check_output(
-        ['gz', 'model', '-m', name, '-i'],
-        stderr=subprocess.STDOUT,
-        text=True,
-        timeout=3.0,
-      )
-    except Exception:
-      self.node.get_logger().warn(
-        f"Unable to query model state for '{name}' via /gazebo/get_entity_state or gz model")
-      return None
+    max_attempts = 5
+    retry_delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+      try:
+        output = subprocess.check_output(
+          ['gz', 'model', '-m', name, '-i'],
+          stderr=subprocess.STDOUT,
+          text=True,
+          timeout=3.0,
+        )
+        break  # success
+      except Exception:
+        if attempt < max_attempts:
+          time.sleep(retry_delay)
+        else:
+          self.node.get_logger().warn(
+            f"Unable to query model state for '{name}' via /gazebo/get_entity_state or gz model")
+          return None
 
     match = re.search(
       r'pose\s*\{\s*position\s*\{\s*x:\s*([^\s]+)\s*y:\s*([^\s]+)\s*z:\s*([^\s]+)\s*\}\s*'

@@ -66,7 +66,8 @@ public:
                      const std::string & description = "");
   bool moveArmCartesian(const std::vector<geometry_msgs::msg::Pose> & waypoints,
                         double eef_step = 0.005,
-                        double jump_threshold = 0.0);
+                        double jump_threshold = 0.0,
+                        bool allow_fallback = true);
   geometry_msgs::msg::Pose makeTopDownPose(double x, double y, double z,
                                            double yaw = 0.0);
   void addGroundCollision();
