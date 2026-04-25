@@ -30,6 +30,6 @@ With the simulation running, call the world spawner service:
 
 TIME SPENT PER TASK (hours, approximate)
 -----------------------------------------
-  Task 1 (Pick and Place):  ~10 hours
+  Task 1 (Pick and Place):  ~30 hours
   Task 2 (Shape Detection):  TBD
   Task 3 (Planning):         TBD

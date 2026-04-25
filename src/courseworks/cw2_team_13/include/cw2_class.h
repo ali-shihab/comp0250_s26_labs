@@ -18,11 +18,14 @@ solution is contained within the cw2_team_<your_team_number> package */
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/constraints.hpp>
+#include <moveit_msgs/msg/position_constraint.hpp>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <tf2/LinearMath/Quaternion.h>
@@ -78,7 +81,43 @@ public:
   bool detectShapePose(const geometry_msgs::msg::Point & obj_xy,
                        const std::string & shape_type,
                        double & out_yaw,
-                       double & out_size);
+                       double & out_size,
+                       double & out_cx,
+                       double & out_cy);
+
+  // Adds a tall conservative collision box at the spawner-reported obj
+  // so MoveIt's joint-space planner routes around the shape during
+  // long approach moves. removeShapeCollision() takes it back out
+  // before the final descent so the gripper can actually reach it.
+  void addShapeCollision(const geometry_msgs::msg::Point & obj,
+                         const std::string & shape_type);
+  void removeShapeCollision();
+
+  // Attaches a worst-case 5*size_s x 5*size_s x 40 mm box to the
+  // panda_hand link at the SHAPE CENTER (= hand frame
+  // (ox_local, -oy_local, EE_TO_FINGER), derived from hand_X = -shape_X
+  // and hand_Y = +shape_Y at grasp time), so the planning scene
+  // matches the physical shape position rather than placing the box
+  // at the fingertip plane.
+  void attachShape(double size_s, double ox_local, double oy_local);
+  // Detaches and removes the held_shape attached collision object.
+  void detachShape();
+
+  // Adds/removes a thin tile slab (z = [0.018, 0.020]) at the centre
+  // of the workspace. Used during the held-shape transit so the
+  // planner refuses paths that drag the held_shape into the tile.
+  // Off during grasp/place descents so it doesn't impose padding-
+  // induced finger collisions.
+  void addTileCollision();
+  void removeTileCollision();
+
+  // Models the basket as four thin wall collision objects + a base
+  // slab so the planner refuses paths that sweep the arm through the
+  // basket during the observation transit. Removed at task end so
+  // it doesn't pollute subsequent tasks (the spawner re-randomises
+  // the basket location every task).
+  void addBasketCollision(const geometry_msgs::msg::Point & goal);
+  void removeBasketCollision();
 
   rclcpp::Node::SharedPtr node_;
   rclcpp::Service<cw2_world_spawner::srv::Task1Service>::SharedPtr t1_service_;
@@ -102,6 +141,20 @@ public:
 
   std::string pointcloud_topic_;
   bool pointcloud_qos_reliable_ = false;
+
+  // /joint_states subscription, used by the post-grasp finger-width
+  // verify in t1_pickAndPlace. We keep our own copy of the latest
+  // finger positions because reading them through MoveIt right after
+  // closeGripper is unreliable in this Gazebo+MoveIt setup.
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+    joint_states_sub_;
+  std::mutex joint_states_mutex_;
+  double finger1_pos_ = 0.04;
+  double finger2_pos_ = 0.04;
+  bool   finger_state_seen_ = false;
+
+  void jointStatesCallback(
+    const sensor_msgs::msg::JointState::ConstSharedPtr msg);
 };
 
 #endif  // CW2_CLASS_H_
