@@ -24,6 +24,9 @@ find_package(PCL REQUIRED)
 find_package(octomap REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(shape_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
+find_package(control_msgs REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(cw2_world_spawner REQUIRED)
 
 set(srv_files
@@ -62,6 +65,9 @@ ament_target_dependencies(${PROJECT_NAME}_cw2_class_lib
   octomap
   octomap_msgs
   shape_msgs
+  trajectory_msgs
+  control_msgs
+  rclcpp_action
   cw2_world_spawner
 )
 
@@ -89,6 +95,9 @@ ament_target_dependencies(cw2_solution_node
   octomap
   octomap_msgs
   shape_msgs
+  trajectory_msgs
+  control_msgs
+  rclcpp_action
   cw2_world_spawner
 )
 

@@ -15,6 +15,7 @@ solution is contained within the cw2_team_<your_team_number> package */
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit_msgs/msg/collision_object.hpp>
@@ -27,6 +28,10 @@ solution is contained within the cw2_team_<your_team_number> package */
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
+#include <trajectory_msgs/msg/joint_trajectory_point.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -71,6 +76,17 @@ public:
                         double eef_step = 0.005,
                         double jump_threshold = 0.0,
                         bool allow_fallback = true);
+  // Same as moveArmCartesian but enforces path_constraints at every IK
+  // checkpoint. If the constrained Cartesian compute fails (fraction <
+  // 0.9 or compute error), and retry_unconstrained is true, falls back
+  // to an unconstrained Cartesian path so the descent still happens.
+  // Returns false only if BOTH attempts fail.
+  bool moveArmCartesianConstrained(
+      const std::vector<geometry_msgs::msg::Pose> & waypoints,
+      const moveit_msgs::msg::Constraints & path_constraints,
+      double eef_step = 0.005,
+      double jump_threshold = 0.0,
+      bool retry_unconstrained = true);
   geometry_msgs::msg::Pose makeTopDownPose(double x, double y, double z,
                                            double yaw = 0.0);
   void addGroundCollision();
@@ -78,12 +94,19 @@ public:
   // Estimates the shape's yaw (folded into [-pi/4, pi/4] since both shapes
   // are C4-symmetric) and arm-width (snapped to {0.020, 0.030, 0.040} m)
   // from the latest point cloud, filtering around obj_xy.
+  // For cross: out_yaw is the M4 estimate (4th-order complex moment).
+  // out_alt_yaw is the MABR (minimum-area bounding rectangle) estimate
+  // when the two disagree by more than ~0.4 rad - the caller then has
+  // both candidates and can disambiguate via a second observation.
+  // For nought: out_alt_yaw is set to the same as out_yaw (no
+  // ambiguity to resolve).
   bool detectShapePose(const geometry_msgs::msg::Point & obj_xy,
                        const std::string & shape_type,
                        double & out_yaw,
                        double & out_size,
                        double & out_cx,
-                       double & out_cy);
+                       double & out_cy,
+                       double * out_alt_yaw = nullptr);
 
   // Adds a tall conservative collision box at the spawner-reported obj
   // so MoveIt's joint-space planner routes around the shape during
@@ -116,7 +139,10 @@ public:
   // basket during the observation transit. Removed at task end so
   // it doesn't pollute subsequent tasks (the spawner re-randomises
   // the basket location every task).
-  void addBasketCollision(const geometry_msgs::msg::Point & goal);
+  // Returns false if the planning scene does not register all 4 walls
+  // within the (extended) timeout, even after a resend retry. Caller
+  // should abort the mission rather than risk knocking the basket.
+  bool addBasketCollision(const geometry_msgs::msg::Point & goal);
   void removeBasketCollision();
 
   rclcpp::Node::SharedPtr node_;
@@ -148,6 +174,25 @@ public:
   // closeGripper is unreliable in this Gazebo+MoveIt setup.
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
     joint_states_sub_;
+  rclcpp::CallbackGroup::SharedPtr joint_states_callback_group_;
+
+  // Action client for the panda_hand_controller. We use the
+  // FollowJointTrajectory action interface (not the raw trajectory
+  // topic) because the controller silently dropped some topic-published
+  // trajectories in this setup - empirical evidence: fingers never moved
+  // and the post-grasp verify caught width=0.0700 (= open) repeatedly.
+  // The action interface acknowledges the goal and reports execution
+  // status, so we know whether the controller accepted and ran the
+  // trajectory.
+  using FjtAction = control_msgs::action::FollowJointTrajectory;
+  using FjtGoalHandle = rclcpp_action::ClientGoalHandle<FjtAction>;
+  rclcpp_action::Client<FjtAction>::SharedPtr hand_action_client_;
+  rclcpp::CallbackGroup::SharedPtr hand_action_callback_group_;
+
+  // Drive both fingers to per_finger_target. Returns true on publish
+  // success; the post-grasp verify in t1_pickAndPlace decides if the
+  // grasp actually worked.
+  bool commandGripper(double per_finger_target, double duration_s);
   std::mutex joint_states_mutex_;
   double finger1_pos_ = 0.04;
   double finger2_pos_ = 0.04;

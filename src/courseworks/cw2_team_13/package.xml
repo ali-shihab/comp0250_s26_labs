@@ -26,6 +26,9 @@
   <depend>octomap</depend>
   <depend>octomap_msgs</depend>
   <depend>shape_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>rclcpp_action</depend>
   <depend>cw2_world_spawner</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>

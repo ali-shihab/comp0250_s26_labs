@@ -59,9 +59,34 @@ cw2::cw2(const rclcpp::Node::SharedPtr &node)
   // Direct subscription to /joint_states so the post-grasp verify can
   // read the actual finger positions without going through MoveIt's
   // (unreliable, in this setup) cached state.
+  // Reentrant callback group so jointStatesCallback can fire while
+  // t1_callback is blocked in commandGripper or in the post-grasp
+  // verify settle loop. Without this, finger position cache is frozen
+  // at whatever it was when t1_callback started (default open width
+  // 0.07 m) and the verify always reads stale data.
+  joint_states_callback_group_ =
+    node_->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  rclcpp::SubscriptionOptions js_opts;
+  js_opts.callback_group = joint_states_callback_group_;
   joint_states_sub_ = node_->create_subscription<sensor_msgs::msg::JointState>(
     "/joint_states", rclcpp::SensorDataQoS(),
-    std::bind(&cw2::jointStatesCallback, this, std::placeholders::_1));
+    std::bind(&cw2::jointStatesCallback, this, std::placeholders::_1),
+    js_opts);
+
+  // Action client for the panda_hand_controller, on a Reentrant
+  // callback group. Without this, the action client's response
+  // callbacks share the default MutuallyExclusiveCallbackGroup with
+  // t1_callback - so when t1_callback blocks waiting on the action
+  // result, the action's response callback can never run because it
+  // can't preempt t1_callback. Symptom: hang forever after the first
+  // grasp move (no respawn, no progress). Reentrant + multi-threaded
+  // executor lets the response callback run on another thread.
+  hand_action_callback_group_ =
+    node_->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  hand_action_client_ = rclcpp_action::create_client<FjtAction>(
+    node_,
+    "/panda_hand_controller/follow_joint_trajectory",
+    hand_action_callback_group_);
 
   arm_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
     node_, "panda_arm");
@@ -70,8 +95,8 @@ cw2::cw2(const rclcpp::Node::SharedPtr &node)
 
   arm_group_->setPlanningTime(5.0);
   arm_group_->setNumPlanningAttempts(5);
-  arm_group_->setMaxVelocityScalingFactor(0.5);
-  arm_group_->setMaxAccelerationScalingFactor(0.5);
+  arm_group_->setMaxVelocityScalingFactor(0.8);
+  arm_group_->setMaxAccelerationScalingFactor(0.8);
   arm_group_->setGoalPositionTolerance(0.005);
   arm_group_->setGoalOrientationTolerance(0.01);
 
@@ -183,11 +208,24 @@ constexpr double BASKET_FLOOR_OFFSET  = 0.015;   // clearance above goal.z
 // up to ~11 deg of tilt while still being a soft 0.54 m/s drop.
 constexpr double SHAPE_LINK_Z_OFFSET  = 0.020;   // link-frame offset in the SDF
 
-// ~2 mm of squeeze on the arm, with a sensible lower bound so we never
-// close so far we crush a contact-stop.
+// AGGRESSIVE close target: command the gripper to close FAR past the
+// shape thickness so the controller continues applying squeeze effort
+// after contact. Without this the controller marks the goal "reached"
+// (or ABORTED on goal-time tolerance) almost immediately and the
+// fingers only lightly touch the shape - shape slips during transit.
+// EVIDENCE for the change: a 40 mm nought run had width=0.040 (light
+// grip = touching but no force), action ABORTED, and the shape fell
+// out of the gripper during the transit to the basket.
+//
+// Per-finger commanded position = (close_w / 2). For an aggressive
+// grip we want commanded position MUCH less than s/2 so that contact
+// reaction is the limiting factor, not the trajectory target.
+//
+// Lower-bounded at 0.005 (= 1 cm width) so we don't try to drive the
+// fingers into each other.
 inline double graspCloseWidth(double s)
 {
-  return std::max(0.012, s - 0.004);
+  return std::max(0.005, s - 0.020);
 }
 
 // panda_hand is bolted on panda_link8 with a fixed -pi/4 yaw offset, so
@@ -207,7 +245,8 @@ bool cw2::detectShapePose(
   double & out_yaw,
   double & out_size,
   double & out_cx,
-  double & out_cy)
+  double & out_cy,
+  double * out_alt_yaw)
 {
   // MULTI-FRAME ACCUMULATION: take N consecutive cloud snapshots from
   // the static observation pose and accumulate ROI-filtered points
@@ -216,7 +255,7 @@ bool cw2::detectShapePose(
   // the M4 yaw estimate computed over the union has lower variance
   // than any single-frame estimate.
   using namespace std::chrono;
-  constexpr int kNumFrames = 5;
+  constexpr int kNumFrames = 3;
   const std::string planning_frame = arm_group_->getPlanningFrame();
 
   std::vector<Eigen::Vector2d> xy_pts;
@@ -231,7 +270,7 @@ bool cw2::detectShapePose(
   std::string cloud_frame;
   for (int frame_idx = 0; frame_idx < kNumFrames; ++frame_idx) {
     // Wait for a NEW frame (sequence advances).
-    const auto deadline = steady_clock::now() + milliseconds(1000);
+    const auto deadline = steady_clock::now() + milliseconds(1500);
     PointCPtr cloud_in;
     while (steady_clock::now() < deadline) {
       std::this_thread::sleep_for(milliseconds(30));
@@ -300,31 +339,159 @@ bool cw2::detectShapePose(
   for (const auto & q : xy_pts) centroid += q;
   centroid /= static_cast<double>(xy_pts.size());
 
-  // M4 PIVOT: the spawner-reported obj_xy is the true geometric
-  // centre of the shape (the SDF model origin coincides with the
-  // shape centre after the link transform). Computing the 4th-order
-  // moment around obj_xy instead of the biased cluster mean removes
-  // the centroid-bias coupling from the yaw estimate and makes the
-  // recovered yaw an unbiased measurement of orientation alone.
-  // Earlier behaviour: 5 deg of yaw bias from cluster mean offset
-  // produced ~5 mm of finger-position error at the wall - enough to
-  // straddle one finger past the wall edge. With obj as pivot, only
-  // the per-frame measurement noise remains.
+  // YAW: SHAPE-AWARE estimator anchored on obj_xy.
+  //
+  //   For NOUGHT (square ring): use minimum-area bounding rectangle
+  //   (MABR). The nought's outer envelope is a filled square, so
+  //   bbox area is minimised when the shape's sides align with the
+  //   test frame axes - giving the correct yaw directly.
+  //
+  //   For CROSS (+ shape): use the 4th-order complex moment M4.
+  //   MABR is WRONG for cross because the bbox of a + at any
+  //   rotation depends on arm-tip projections plus arm thickness,
+  //   and the minimum-area rotation is at psi - pi/4 (NOT psi).
+  //   For an axis-aligned cross, MABR returns +-pi/4. A grasp aimed
+  //   at +X arm at world angle = MABR-yaw lands in the empty space
+  //   between two arms - exactly the user's reported "fingers
+  //   close on air" failure for crosses (e.g. detected -0.676,
+  //   true cross arms at +0.109 etc, no arm at -0.676 -> miss).
+  //   M4 is the right tool: M4 = sum (z - pivot)^4 has phase 4*psi
+  //   for the cross's 4-fold symmetric mass distribution, so
+  //   recovered yaw = arg(M4) / 4 is the actual arm direction.
   const Eigen::Vector2d pivot(obj_xy.x, obj_xy.y);
+  double best_yaw = 0.0;
 
-  // 4th-order complex moment. The nought's corners flip its sign, so
-  // cancel that phase before dividing by 4.
-  std::complex<double> M4(0.0, 0.0);
-  for (const auto & q : xy_pts) {
-    const std::complex<double> z(q.x() - pivot.x(), q.y() - pivot.y());
-    const std::complex<double> z2 = z * z;
-    M4 += z2 * z2;
+  if (shape_type == "nought") {
+    // MABR helper: bbox area after rotating cluster by -theta.
+    auto bbox_area = [&](double theta) -> double {
+      const double cs = std::cos(-theta), sn = std::sin(-theta);
+      double xmin =  std::numeric_limits<double>::infinity();
+      double xmax = -std::numeric_limits<double>::infinity();
+      double ymin =  std::numeric_limits<double>::infinity();
+      double ymax = -std::numeric_limits<double>::infinity();
+      for (const auto & q : xy_pts) {
+        const double dx = q.x() - pivot.x();
+        const double dy = q.y() - pivot.y();
+        const double rx = cs * dx - sn * dy;
+        const double ry = sn * dx + cs * dy;
+        if (rx < xmin) xmin = rx;
+        if (rx > xmax) xmax = rx;
+        if (ry < ymin) ymin = ry;
+        if (ry > ymax) ymax = ry;
+      }
+      return (xmax - xmin) * (ymax - ymin);
+    };
+
+    constexpr int kCoarseSteps = 90;
+    const double half_range = M_PI / 4.0;
+    double best_area = std::numeric_limits<double>::infinity();
+    for (int i = 0; i <= kCoarseSteps; ++i) {
+      const double theta =
+        -half_range + 2.0 * half_range * i / kCoarseSteps;
+      const double a = bbox_area(theta);
+      if (a < best_area) { best_area = a; best_yaw = theta; }
+    }
+    constexpr int kFineSteps = 100;
+    const double fine_range = M_PI / 90.0;
+    const double coarse_min = best_yaw;
+    for (int i = -kFineSteps; i <= kFineSteps; ++i) {
+      const double theta = coarse_min + fine_range * i / kFineSteps;
+      if (theta < -half_range || theta > half_range) continue;
+      const double a = bbox_area(theta);
+      if (a < best_area) { best_area = a; best_yaw = theta; }
+    }
+  } else {
+    // CROSS: 4th-order complex moment around obj_xy. The shape's
+    // 4-fold symmetric mass distribution gives M4 phase = 4 * psi
+    // (cross has phi_shape=0 in our earlier derivation: arms
+    // contribute z^4 = +t^4 along axes, no sign flip).
+    std::complex<double> M4(0.0, 0.0);
+    double r4_sum = 0.0;  // sum |z|^4, for normalised |M4| diagnostic
+    for (const auto & q : xy_pts) {
+      const std::complex<double> z(q.x() - pivot.x(),
+                                    q.y() - pivot.y());
+      const std::complex<double> z2 = z * z;
+      const std::complex<double> z4 = z2 * z2;
+      M4 += z4;
+      r4_sum += std::abs(z4);
+    }
+    const double m4_arg = std::arg(M4);  // in (-pi, pi]
+    const double m4_mag = std::abs(M4);
+    // Coherence: 1.0 means all z^4 vectors point the same way (perfect
+    // C4 alignment). <0.3 means M4 is dominated by noise / asymmetric
+    // sampling and the argument has no meaning.
+    const double m4_coh = (r4_sum > 1e-12) ? (m4_mag / r4_sum) : 0.0;
+    double yaw_raw = 0.25 * m4_arg;
+    const double yaw_pre_fold = yaw_raw;
+    while (yaw_raw >  M_PI / 4.0) yaw_raw -= M_PI / 2.0;
+    while (yaw_raw < -M_PI / 4.0) yaw_raw += M_PI / 2.0;
+    best_yaw = yaw_raw;
+
+    // For comparison against MABR-at-this-pivot. If M4 is wrong (low
+    // coherence or fingers-clip-corner failures), we'd expect the
+    // MABR-best yaw at this pivot to disagree by ~pi/4 (cross arms
+    // vs cross diagonal). Compare raw OBB area at coarse steps;
+    // duplicates the MABR cost to avoid coupling logic to control flow.
+    const int kDiagSteps = 18;  // 5-deg granularity over [-pi/4,pi/4]
+    double mabr_best_yaw = 0.0, mabr_best_area = std::numeric_limits<double>::infinity();
+    for (int i = -kDiagSteps; i <= kDiagSteps; ++i) {
+      const double theta = (M_PI / 4.0) * i / kDiagSteps;
+      const double cs_t = std::cos(-theta), sn_t = std::sin(-theta);
+      double xlo =  std::numeric_limits<double>::infinity();
+      double xhi = -std::numeric_limits<double>::infinity();
+      double ylo =  std::numeric_limits<double>::infinity();
+      double yhi = -std::numeric_limits<double>::infinity();
+      for (const auto & q : xy_pts) {
+        const double dx = q.x() - pivot.x(), dy = q.y() - pivot.y();
+        const double rx = cs_t * dx - sn_t * dy;
+        const double ry = sn_t * dx + cs_t * dy;
+        if (rx < xlo) xlo = rx;
+        if (rx > xhi) xhi = rx;
+        if (ry < ylo) ylo = ry;
+        if (ry > yhi) yhi = ry;
+      }
+      const double area = (xhi - xlo) * (yhi - ylo);
+      if (area < mabr_best_area) { mabr_best_area = area; mabr_best_yaw = theta; }
+    }
+    // Branch difference: how far apart M4 and MABR are after C4 folding.
+    double dyaw = best_yaw - mabr_best_yaw;
+    while (dyaw >  M_PI / 4.0) dyaw -= M_PI / 2.0;
+    while (dyaw < -M_PI / 4.0) dyaw += M_PI / 2.0;
+
+    // ROLLED BACK: previously when |dyaw|>0.4 we overrode best_yaw
+    // with mabr_best_yaw on the assumption MABR was always right
+    // when the two disagreed. EVIDENCE that this was wrong: log run
+    // had M4=0.066, MABR=-0.698 (diff=+0.764), the override picked
+    // MABR, and the gripper closed on air at width=0.0100 - MABR
+    // was off by pi/4 in that case. Both estimators can fail with
+    // ~10% probability; we cannot pick the right one from the
+    // first-view data alone. Now we always return M4 as primary
+    // and expose MABR as the alternative; the caller is expected
+    // to break the tie via a second observation when they disagree.
+    if (out_alt_yaw) {
+      *out_alt_yaw = mabr_best_yaw;
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+      "detectShapePose[cross-M4]: pivot=(%.3f,%.3f) N=%zu "
+      "arg(M4)=%.3f -> /4=%.3f -> folded=%.3f  "
+      "|M4|=%.3e r4_sum=%.3e coh=%.3f  "
+      "MABR_yaw=%.3f branch_diff=%.3f",
+      pivot.x(), pivot.y(), xy_pts.size(),
+      m4_arg, yaw_pre_fold, best_yaw,
+      m4_mag, r4_sum, m4_coh,
+      mabr_best_yaw, dyaw);
   }
-  const double phi_shape = (shape_type == "nought") ? M_PI : 0.0;
-  double yaw = 0.25 * std::arg(M4 * std::polar(1.0, -phi_shape));
-  while (yaw >  M_PI / 4.0) yaw -= M_PI / 2.0;
-  while (yaw < -M_PI / 4.0) yaw += M_PI / 2.0;
-  out_yaw = yaw;
+
+  // For nought, no ambiguity exists; set alt = primary so caller's
+  // diff check is a no-op. (For cross, the else-branch above has
+  // already populated *out_alt_yaw.)
+  if (out_alt_yaw && shape_type == "nought") {
+    *out_alt_yaw = best_yaw;
+  }
+
+  out_yaw = best_yaw;
+  double yaw = best_yaw;  // alias for the existing OBB / size code below
 
   // Oriented bounding box in the (mean-centroid, detected-yaw) frame.
   // The mean centroid is biased toward the far-from-camera side because
@@ -423,8 +590,18 @@ bool cw2::t1_pickAndPlace(
   // where the basket physically sits. The user observed the arm
   // dipping low and shoving the basket out of place during the
   // observation move - cause: nothing in the planning scene was
-  // modelling the basket.
-  addBasketCollision(goal);
+  // modelling the basket. EVIDENCE that this still happens
+  // intermittently: cw2.log run had a frame where addBasketCollision
+  // verify timed out at 1 s ("basket walls did not appear within 1 s")
+  // and the next observation move physically knocked the basket.
+  // Now we return false on verify timeout and the caller aborts.
+  if (!addBasketCollision(goal)) {
+    RCLCPP_ERROR(node_->get_logger(),
+      "addBasketCollision failed (planning scene did not register "
+      "walls); aborting task to avoid knocking the basket.");
+    removeBasketCollision();
+    return false;
+  }
 
   // Open first so the fingers don't occlude the wrist camera during
   // observation.
@@ -446,13 +623,101 @@ bool cw2::t1_pickAndPlace(
   double yaw = 0.0;
   double size_s = 0.040;
   double cx = obj.x, cy = obj.y;
-  if (!detectShapePose(obj, shape_type, yaw, size_s, cx, cy)) {
+  double alt_yaw = 0.0;
+  if (!detectShapePose(obj, shape_type, yaw, size_s, cx, cy, &alt_yaw)) {
+    // Cloud went silent for 4+ seconds (Gazebo depth-camera plugin
+    // transient - we have evidence of this between missions).
+    // Sleep, then retry the full 3-frame accumulation once before
+    // aborting. The cloud subscriber is already on a Reentrant
+    // callback group so the issue is not at our end.
     RCLCPP_WARN(node_->get_logger(),
-      "perception failed, falling back to yaw=0, size=40mm and obj xy");
-    yaw = 0.0;
-    size_s = 0.040;
-    cx = obj.x;
-    cy = obj.y;
+      "perception failed first attempt - sleeping 2s and retrying");
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (!detectShapePose(obj, shape_type, yaw, size_s, cx, cy, &alt_yaw)) {
+      RCLCPP_ERROR(node_->get_logger(),
+        "perception failed AFTER retry - aborting task. Falling back "
+        "to yaw=0/size=40mm produces wrong grasps on tilted shapes; "
+        "better to abort cleanly than mis-grasp.");
+      removeShapeCollision();
+      removeBasketCollision();
+      return false;
+    }
+    RCLCPP_INFO(node_->get_logger(),
+      "perception recovered on retry");
+  }
+
+  // CROSS YAW TIEBREAKER. EVIDENCE this is needed: cw2.log has runs
+  // where M4 was wrong (M4 picked diagonal branch, MABR correct) AND
+  // separate runs where MABR was wrong (M4 picked arm-aligned arms,
+  // MABR off by pi/4). Both estimators have ~10% failure rate on
+  // small / partially-occluded crosses, and we cannot tell which is
+  // wrong from a single viewpoint. So when they disagree by more
+  // than 0.4 rad we move to a SECOND observation pose offset
+  // laterally (different sampling/occlusion pattern) and re-run
+  // detectShapePose. We then pick whichever first-view candidate is
+  // closer to the second-view's M4 estimate. The TRUE yaw should be
+  // consistent across viewpoints; sampling artifacts that flip M4
+  // are not.
+  if (shape_type == "cross") {
+    double diff_first = yaw - alt_yaw;
+    while (diff_first >  M_PI / 4.0) diff_first -= M_PI / 2.0;
+    while (diff_first < -M_PI / 4.0) diff_first += M_PI / 2.0;
+    if (std::fabs(diff_first) > 0.4) {
+      RCLCPP_WARN(node_->get_logger(),
+        "T1[cross]: yaw ambiguous (M4=%.3f, MABR=%.3f, diff=%.3f) - "
+        "doing second observation 60mm offset",
+        yaw, alt_yaw, diff_first);
+
+      // Move to a second observation pose offset 60 mm in +X and
+      // 40 mm in -Y (asymmetric so any directional sampling bias
+      // shifts measurably). Same SAFE_ALTITUDE so transit is
+      // short and obstacle-free.
+      const double obs2_x = obj.x + 0.060;
+      const double obs2_y = obj.y - 0.040;
+      if (!moveArmToPose(
+          makeTopDownPose(obs2_x, obs2_y, SAFE_ALTITUDE, 0.0),
+          "second-observation-tiebreaker")) {
+        RCLCPP_WARN(node_->get_logger(),
+          "T1[cross]: second-obs move failed - keeping first-view "
+          "M4 as best guess");
+      } else {
+        double yaw2 = 0.0, size2 = 0.0, cx2 = 0.0, cy2 = 0.0;
+        double alt_yaw2 = 0.0;
+        if (!detectShapePose(obj, shape_type, yaw2, size2, cx2, cy2,
+                             &alt_yaw2)) {
+          RCLCPP_WARN(node_->get_logger(),
+            "T1[cross]: second-obs detect failed - keeping first-view "
+            "M4 as best guess");
+        } else {
+          // Compare second-view M4 to both first-view candidates,
+          // folded into [-pi/4, pi/4] so the comparison is C4-aware.
+          auto fold = [](double a) {
+            while (a >  M_PI / 4.0) a -= M_PI / 2.0;
+            while (a < -M_PI / 4.0) a += M_PI / 2.0;
+            return a;
+          };
+          const double d_to_M4   = std::fabs(fold(yaw2 - yaw));
+          const double d_to_MABR = std::fabs(fold(yaw2 - alt_yaw));
+          if (d_to_MABR < d_to_M4) {
+            RCLCPP_INFO(node_->get_logger(),
+              "T1[cross]: tiebreaker chose MABR (yaw2=%.3f, "
+              "d(M4)=%.3f, d(MABR)=%.3f)",
+              yaw2, d_to_M4, d_to_MABR);
+            yaw = alt_yaw;
+          } else {
+            RCLCPP_INFO(node_->get_logger(),
+              "T1[cross]: tiebreaker chose M4 (yaw2=%.3f, "
+              "d(M4)=%.3f, d(MABR)=%.3f)",
+              yaw2, d_to_M4, d_to_MABR);
+            // yaw stays at first-view M4
+          }
+          // Prefer the second view's centre estimate too, since the
+          // ambiguity-triggering first view had biased sampling.
+          cx = cx2;
+          cy = cy2;
+        }
+      }
+    }
   }
 
   // Grasp offset in shape-local frame, then rotate into world.
@@ -599,24 +864,82 @@ bool cw2::t1_pickAndPlace(
   if (!moveArmCartesian(
       {makeTopDownPose(grasp_x, grasp_y, pre_grasp_z, link8_yaw)},
       0.005, 0.0, /*allow_fallback=*/false)) return false;
-  if (!moveArmCartesian(
-      {makeTopDownPose(grasp_x, grasp_y, grasp_ee_z, link8_yaw)},
-      0.005, 0.0, /*allow_fallback=*/false)) return false;
+  // Final descent to grasp pose: tighter eef_step than the
+  // pre_grasp descent. computeCartesianPath calls IK at every
+  // eef_step boundary; smaller step means more checkpoints, less
+  // joint reconfiguration between checkpoints, less lateral EE
+  // drift on tilted-arm configurations. Targets the user's
+  // outer-finger-clips-wall-during-descent failure mode for
+  // mid-large noughts where the open-finger margin to the wall
+  // is only ~20 mm.
+  //
+  // Additionally, enforce a PositionConstraint on panda_link8
+  // throughout this descent: a thin XY box (+/-5 mm) centered on
+  // the descent column. This forces the IK solver at every
+  // checkpoint to find joint solutions whose link8 origin (and
+  // therefore the TCP, which is just below it on a top-down grasp)
+  // stays inside the column. Eliminates the 5-10 mm lateral drift
+  // that lets the outer finger clip the basket wall on mid-large
+  // noughts. If the constraint makes IK infeasible we fall back to
+  // the unconstrained descent rather than abort the whole grasp.
+  {
+    moveit_msgs::msg::Constraints descent_constraints;
+    moveit_msgs::msg::PositionConstraint pc;
+    pc.header.frame_id = arm_group_->getPlanningFrame();
+    pc.link_name = "panda_link8";
+    pc.target_point_offset.x = 0.0;
+    pc.target_point_offset.y = 0.0;
+    pc.target_point_offset.z = 0.0;
+    pc.weight = 1.0;
+    shape_msgs::msg::SolidPrimitive box;
+    box.type = shape_msgs::msg::SolidPrimitive::BOX;
+    box.dimensions.resize(3);
+    // half_xy = 0.005 -> full width 0.010. Z spans the descent
+    // (pre_grasp_z down to grasp_ee_z) plus a small margin so the
+    // checkpoint at either endpoint isn't on the box face.
+    box.dimensions[0] = 0.010;
+    box.dimensions[1] = 0.010;
+    box.dimensions[2] = (pre_grasp_z - grasp_ee_z) + 0.020;
+    pc.constraint_region.primitives.push_back(box);
+    geometry_msgs::msg::Pose region_pose;
+    region_pose.position.x = grasp_x;
+    region_pose.position.y = grasp_y;
+    region_pose.position.z = (pre_grasp_z + grasp_ee_z) / 2.0;
+    region_pose.orientation.w = 1.0;
+    pc.constraint_region.primitive_poses.push_back(region_pose);
+    descent_constraints.position_constraints.push_back(pc);
+
+    if (!moveArmCartesianConstrained(
+        {makeTopDownPose(grasp_x, grasp_y, grasp_ee_z, link8_yaw)},
+        descent_constraints,
+        0.002, 0.0, /*retry_unconstrained=*/true)) return false;
+  }
 
   if (!closeGripper(close_w)) return false;
 
-  // POST-GRASP VERIFY: if the fingers reached the commanded close
-  // width (or below), they're closed on air - the shape was either
-  // missed entirely or knocked away by the descent. We MUST abort
-  // before lift+transit+place; otherwise the rest of the pipeline
-  // proceeds as if the shape were gripped (the user's exact symptom:
-  // 'gripper slammed the nought, made it bounce, then proceeded to
-  // the basket as if it had it'). When the shape IS gripped, the
-  // fingers stall on its wall/arm thickness s, so total finger width
-  // ~= s; commanded close_w = max(0.012, s-0.004), so a successful
-  // grip leaves total width >= close_w + 0.004 in the steady state.
-  // We use a 2 mm tolerance against measurement noise.
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // POST-GRASP VERIFY. The hand is driven by panda_hand_controller via
+  // a JointTrajectory topic publish. Empirical evidence: ALL 8 runs in
+  // the prior log (7 successful, 1 failed) showed width=0.0699 at the
+  // verify time -> we were reading BEFORE the close trajectory had
+  // even started executing (controller takes ~2 s; our previous 200
+  // ms sleep was way too short). The successful runs only worked
+  // because the close happened ASYNCHRONOUSLY during the lift/transit.
+  // The failed run was the case where the close ALSO didn't happen
+  // during transit (or the shape was knocked away).
+  //
+  // Two fixes:
+  //   1) Wait long enough for the close to actually complete. Poll
+  //      /joint_states until either both fingers stop changing more
+  //      than 0.5 mm between samples, or a hard 3 s deadline.
+  //   2) Check BOTH bounds. If width < close_w + 2 mm, fingers closed
+  //      on air. If width > size_s + 8 mm, fingers never closed
+  //      (still at the open ~70 mm). Either way: abort.
+  // Action-client commandGripper already blocked on the controller's
+  // result, so fingers are at their final position. With joint_states
+  // on a reentrant callback group the cache is always fresh; we just
+  // sleep one publish-period (~40 ms at 25 Hz) to make sure we see
+  // the post-trajectory state, not the last pre-close one.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
   {
     double f1 = 0.0, f2 = 0.0;
     bool seen = false;
@@ -626,16 +949,73 @@ bool cw2::t1_pickAndPlace(
       f2 = finger2_pos_;
       seen = finger_state_seen_;
     }
+
     const double total_width = f1 + f2;
-    const double threshold = close_w + 0.002;
+    const double lower = close_w + 0.005;
+    // Upper bound = size_s + 0.015. The +0.015 absorbs ODE
+    // min_depth=5e-3 contact penetration (per finger) plus a few
+    // mm of slack. Without this, a successful grip with deep
+    // contact penetration (e.g. width=0.039 on s=0.030 wall = both
+    // fingers 4.5 mm INTO the wall material due to controller push)
+    // would be rejected as "fingers near open width" even though
+    // physically the wall is firmly clamped. The fully-open case
+    // (width = 2 x 0.040 = 0.080) is still well above 0.055 (=
+    // 0.040 + 0.015 for the largest shape) so genuine open-fingers
+    // failures are still caught.
+    const double upper = size_s + 0.015;
+    // Per-finger asymmetry check: a successful grip on a centred
+    // wall stalls both fingers at ~s/2 each, so |f1 - f2| should
+    // be < 5 mm. The user's failed run had f1=0.0379 (= URDF max
+    // open joint limit, finger pushed back by collision) and
+    // f2=-0.0003 (= fully closed, no shape on its side). The total
+    // width 0.0376 happened to sit inside [0.015, 0.038] for an
+    // s=0.030 shape, so the width-only check passed wrongly.
+    // Adding |f1 - f2| < 0.005 catches the collision-pushed-open
+    // pattern bilaterally.
+    const double asymmetry = std::abs(f1 - f2);
+    // Asymmetry threshold = size_s. Geometric reasoning: with TCP
+    // offset d from wall centre, both fingers still contact the wall
+    // iff d < s/2 (wall straddles TCP), and asymmetry = 2d. So
+    // |f1-f2| < s iff bilateral contact. Above s, the wall is
+    // entirely on one finger's side - only that one contacts and
+    // the grip is unilateral / weak. EVIDENCE for the change:
+    // a 20 mm nought run had f1=0.0049, f2=0.0151, width=0.020 (=s,
+    // valid grip), asym=0.010 (TCP 5 mm off wall centre, both
+    // fingers still on the wall). The fixed 5 mm threshold rejected
+    // this real grip; size_s (=0.020) accepts it while still
+    // catching the collision-pushed-open case (previous failure
+    // had asym=0.038 with s=0.030, > 0.030 threshold -> caught).
+    const double max_asymmetry = size_s;
     RCLCPP_INFO(node_->get_logger(),
-      "grasp verify: seen=%d f1=%.4f f2=%.4f width=%.4f close_w=%.4f thr=%.4f",
-      seen, f1, f2, total_width, close_w, threshold);
-    if (seen && total_width < threshold) {
+      "grasp verify: seen=%d f1=%.4f f2=%.4f width=%.4f asym=%.4f "
+      "expected=[%.4f, %.4f], asym<=%.4f (close_w=%.4f, size_s=%.4f)",
+      seen, f1, f2, total_width, asymmetry,
+      lower, upper, max_asymmetry, close_w, size_s);
+    if (seen && total_width < lower) {
       RCLCPP_ERROR(node_->get_logger(),
-        "grasp verify FAILED: fingers fully closed (width=%.4f < %.4f) - "
-        "no shape gripped, aborting before lift",
-        total_width, threshold);
+        "grasp verify FAILED: width=%.4f below %.4f - fingers "
+        "closed on air (no shape between them); aborting before lift",
+        total_width, lower);
+      openGripper();
+      removeBasketCollision();
+      return false;
+    }
+    if (seen && total_width > upper) {
+      RCLCPP_ERROR(node_->get_logger(),
+        "grasp verify FAILED: width=%.4f above %.4f - fingers never "
+        "closed (still near open width); aborting before lift",
+        total_width, upper);
+      openGripper();
+      removeBasketCollision();
+      return false;
+    }
+    if (seen && asymmetry > max_asymmetry) {
+      RCLCPP_ERROR(node_->get_logger(),
+        "grasp verify FAILED: f1-f2 asymmetry %.4f > %.4f - one "
+        "finger collided with the shape during descent and was "
+        "pushed open while the other closed unobstructed; "
+        "aborting before lift",
+        asymmetry, max_asymmetry);
       openGripper();
       removeBasketCollision();
       return false;
@@ -704,34 +1084,231 @@ bool cw2::t1_pickAndPlace(
 
   if (!openGripper()) return false;
 
+  // Settle pause: openGripper returns when the action client + a
+  // short joint-state stability check report success, but the
+  // physics simulator can still have residual contact between
+  // finger pads and the just-released shape. Without this pause
+  // the immediate Cartesian lift drags the shape on a finger pad
+  // and tips it onto the basket wall (user-observed once: a cross
+  // got dragged out of the basket and ended up on the wall).
+  std::this_thread::sleep_for(std::chrono::milliseconds(350));
+
   // Shape is now in the basket - detach it from the gripper so the
   // retreat (and any subsequent task) doesn't see a phantom shape
   // attached to the hand.
   detachShape();
 
-  // Warn-only: if the retreat fails the shape is already dropped.
-  // Use transit_yaw because the descent was at that yaw; reverting
-  // to link8_yaw here would force an unnecessary yaw rotation right
-  // after release and could re-trigger the same goal-IK failure
-  // we just avoided.
-  if (!moveArmCartesian(
-      {makeTopDownPose(place_x, place_y, safe_z, transit_yaw)},
-      0.005, 0.0, /*allow_fallback=*/false)) {
-    RCLCPP_WARN(node_->get_logger(), "retreat failed after place");
+  // Retreat after place. Multi-stage strategy because the prior
+  // single-call Cartesian retreat was failing at 0.0% on EVERY run
+  // (see /tmp/cw2.log: repeated "moveArmCartesian: only 0.0%
+  // retreat failed after place"). The arm was being left at the
+  // basket location, and the next run's joint-space planner then
+  // swept through wherever the next basket happened to be.
+  //
+  // Hypothesised cause of the 0% failure: the planning scene at
+  // this instant has the held_shape AttachedCollisionObject just
+  // detached + the basket_walls + the open fingers AND maybe a
+  // stale physics state where the just-released shape is still
+  // sitting between the wall corners and the open fingers. The
+  // first Cartesian IK checkpoint inherits that "in-collision"
+  // start state and rejects everything.
+  //
+  // Stage 1: Cartesian lift by APPROACH_DIST (10 cm) with
+  // avoid_collisions=false. We're going straight up from inside an
+  // open basket; the only thing we could hit is the basket walls
+  // we own, and they're <50 mm tall so a 100 mm lift clears them.
+  // Disabling collision avoidance bypasses any stale start-state
+  // collision flag.
+  // Stage 2: Joint-space plan to safe_z. Now well above the basket,
+  // the planner has full freedom to find a path; it can choose any
+  // elbow configuration.
+  RCLCPP_INFO(node_->get_logger(),
+      "post-place retreat from place=(%.3f,%.3f,%.3f) yaw=%.3f -> "
+      "lift then go-home(ready)",
+      place_x, place_y, place_ee_z, transit_yaw);
+
+  // Stage 1: collision-disabled Cartesian lift.
+  {
+    moveit_msgs::msg::RobotTrajectory traj;
+    const double lift_z = std::min(safe_z,
+                                   place_ee_z + APPROACH_DIST);
+    std::vector<geometry_msgs::msg::Pose> wps = {
+      makeTopDownPose(place_x, place_y, lift_z, transit_yaw)};
+    double frac = arm_group_->computeCartesianPath(
+        wps, 0.005, 0.0, traj, /*avoid_collisions=*/false);
+    if (frac >= 0.9) {
+      moveit::planning_interface::MoveGroupInterface::Plan plan;
+      plan.trajectory_ = traj;
+      auto rc = arm_group_->execute(plan);
+      if (rc != moveit::core::MoveItErrorCode::SUCCESS) {
+        RCLCPP_WARN(node_->get_logger(),
+            "post-place retreat stage1 exec failed (%d)",
+            static_cast<int>(rc.val));
+      }
+    } else {
+      RCLCPP_WARN(node_->get_logger(),
+          "post-place retreat stage1 cartesian only %.1f%% (collision-off)",
+          frac * 100.0);
+    }
   }
+
+  // Stage 2: joint-space plan back to the SRDF named "ready" pose.
+  // EVIDENCE for going home rather than lingering above the basket:
+  // the prior retreat targeted (place_x, place_y, safe_z) which is
+  // directly over the just-released basket, in a wrist orientation
+  // (transit_yaw=-pi/4) that is not the natural arm posture. Each
+  // subsequent run then had to plan a long swing across the entire
+  // workspace from that awkward pose to the next observation pose,
+  // and this manifested visually as the arm doing a "full 360"
+  // between runs. Returning to a canonical home posture instead
+  // makes every run start from the same predictable joint state,
+  // shortens the next observation move, and pulls the arm
+  // physically clear of the goal area.
+  arm_group_->setNamedTarget("ready");
+  moveit::planning_interface::MoveGroupInterface::Plan home_plan;
+  auto home_rc = arm_group_->plan(home_plan);
+  if (home_rc != moveit::core::MoveItErrorCode::SUCCESS) {
+    RCLCPP_WARN(node_->get_logger(),
+        "post-place retreat stage2 (plan to 'ready') failed (%d)",
+        static_cast<int>(home_rc.val));
+  } else {
+    auto exec_rc = arm_group_->execute(home_plan);
+    if (exec_rc != moveit::core::MoveItErrorCode::SUCCESS) {
+      RCLCPP_WARN(node_->get_logger(),
+          "post-place retreat stage2 (exec 'ready') failed (%d)",
+          static_cast<int>(exec_rc.val));
+    }
+  }
+  arm_group_->clearPoseTargets();
 
   removeBasketCollision();
   return true;
 }
 
 
+bool cw2::commandGripper(double per_finger_target, double duration_s)
+{
+  const double tgt = std::max(0.0, std::min(0.04, per_finger_target));
+
+  // Wait for the action server (the controller) to be available.
+  if (!hand_action_client_->wait_for_action_server(std::chrono::seconds(2))) {
+    RCLCPP_ERROR(node_->get_logger(),
+      "commandGripper: panda_hand_controller follow_joint_trajectory "
+      "action server not available");
+    return false;
+  }
+
+  FjtAction::Goal goal_msg;
+  goal_msg.trajectory.header.stamp = node_->now();
+  goal_msg.trajectory.joint_names = {
+    "panda_finger_joint1", "panda_finger_joint2"
+  };
+
+  trajectory_msgs::msg::JointTrajectoryPoint pt;
+  pt.positions = {tgt, tgt};
+  pt.velocities = {0.0, 0.0};
+  const auto ns =
+    static_cast<int64_t>(std::max(0.05, duration_s) * 1e9);
+  pt.time_from_start.sec = static_cast<int32_t>(ns / 1000000000);
+  pt.time_from_start.nanosec = static_cast<uint32_t>(ns % 1000000000);
+  goal_msg.trajectory.points.push_back(pt);
+
+  // Tolerances: relaxed because shape contact stops the fingers short
+  // of the commanded position by a few mm. We don't want the controller
+  // to mark the goal as failed in that case.
+  goal_msg.goal_time_tolerance.sec = 2;
+
+  // Send goal. With the action client on a Reentrant callback group
+  // and the multi-threaded executor running, we can simply wait on
+  // the future from this thread - the action client's response
+  // callbacks run on a different executor thread and unblock the
+  // future for us. We do NOT use spin_until_future_complete, which
+  // would deadlock because t1_callback is itself running on the
+  // executor.
+  auto goal_future = hand_action_client_->async_send_goal(goal_msg);
+  if (goal_future.wait_for(std::chrono::seconds(2)) !=
+      std::future_status::ready) {
+    RCLCPP_ERROR(node_->get_logger(),
+      "commandGripper: timed out waiting for goal acceptance");
+    return false;
+  }
+
+  auto goal_handle = goal_future.get();
+  if (!goal_handle) {
+    RCLCPP_ERROR(node_->get_logger(),
+      "commandGripper: goal was REJECTED by panda_hand_controller");
+    return false;
+  }
+
+  // Wait for the controller's result. ABORTED (code 4) is expected on
+  // contact stop; we just log and let the post-grasp verify decide.
+  // If the action result times out, fall through to a polling wait
+  // on /joint_states - the controller may still be executing, or it
+  // may have reached the goal and the result message just got lost.
+  auto result_future = hand_action_client_->async_get_result(goal_handle);
+  const auto status = result_future.wait_for(
+    std::chrono::duration<double>(duration_s + 4.0));
+  if (status == std::future_status::ready) {
+    const auto wrapped = result_future.get();
+    // GoalStatus enum: 4=SUCCEEDED, 5=CANCELED, 6=ABORTED.
+    RCLCPP_INFO(node_->get_logger(),
+      "commandGripper: result code=%d (4=SUCCEEDED, 5=CANCELED, 6=ABORTED)",
+      static_cast<int>(wrapped.code));
+  } else {
+    RCLCPP_WARN(node_->get_logger(),
+      "commandGripper: action result timed out - falling through to "
+      "joint_states polling to confirm finger motion");
+  }
+
+  // GROUND-TRUTH SETTLE: poll /joint_states until fingers stop
+  // moving. This is the authoritative check - the action client
+  // result can be lost, delayed, or report ABORTED for a successful
+  // grasp, but fingers actually being at a stable position is what
+  // matters for the verify downstream. Wait up to 2 s for stability.
+  using namespace std::chrono;
+  const auto settle_deadline = steady_clock::now() + milliseconds(2000);
+  double prev_f1 = -1.0, prev_f2 = -1.0;
+  int stable_count = 0;
+  while (steady_clock::now() < settle_deadline) {
+    double f1, f2;
+    bool seen;
+    {
+      std::lock_guard<std::mutex> lk(joint_states_mutex_);
+      f1 = finger1_pos_;
+      f2 = finger2_pos_;
+      seen = finger_state_seen_;
+    }
+    if (seen && std::abs(f1 - prev_f1) < 0.0005 &&
+                std::abs(f2 - prev_f2) < 0.0005) {
+      if (++stable_count >= 5) break;
+    } else {
+      stable_count = 0;
+    }
+    prev_f1 = f1;
+    prev_f2 = f2;
+    std::this_thread::sleep_for(milliseconds(40));
+  }
+
+  return true;
+}
+
 bool cw2::openGripper()
 {
-  hand_group_->setNamedTarget("open");
-  auto result = hand_group_->move();
-  if (result != moveit::core::MoveItErrorCode::SUCCESS) {
-    RCLCPP_ERROR(node_->get_logger(),
-      "openGripper failed (code %d)", static_cast<int>(result.val));
+  // 0.040 m is the URDF upper joint limit (hand.xacro: upper="0.04").
+  // EVIDENCE for using the maximum: during the descent to grasp, the
+  // OUTSIDE finger sits at TCP + per_finger from the wall centerline.
+  // Margin to the wall outer face = per_finger - s/2:
+  //   s=0.020 -> 0.030 m at per_finger=0.035, 0.030 m at 0.040
+  //   s=0.030 -> 0.020 m at per_finger=0.035, 0.025 m at 0.040
+  //   s=0.040 -> 0.015 m at per_finger=0.035, 0.020 m at 0.040
+  // The user observed consistent collision of the outside finger with
+  // the wall TOP during descent on mid-large noughts (s>=0.030),
+  // exactly the cases with smallest margin. Opening to the URDF
+  // maximum gives 5 mm of extra clearance on every size and
+  // increases the 40 mm-nought margin by 33%.
+  const bool ok = commandGripper(0.040, 0.6);
+  if (!ok) {
+    RCLCPP_ERROR(node_->get_logger(), "openGripper: action call failed");
     return false;
   }
   return true;
@@ -739,19 +1316,13 @@ bool cw2::openGripper()
 
 bool cw2::closeGripper(double width)
 {
-  const double finger_pos = width / 2.0;
-  std::map<std::string, double> targets;
-  targets["panda_finger_joint1"] = finger_pos;
-  targets["panda_finger_joint2"] = finger_pos;
-  hand_group_->setJointValueTarget(targets);
-
-  auto result = hand_group_->move();
-  if (result != moveit::core::MoveItErrorCode::SUCCESS) {
-    // Contact stop is expected when the fingers hit the arm before
-    // reaching the commanded width.
+  const double per_finger = width / 2.0;
+  // commandGripper now blocks on the action result, so fingers are at
+  // their final position when this returns. No additional sleep needed.
+  const bool ok = commandGripper(per_finger, 1.0);
+  if (!ok) {
     RCLCPP_WARN(node_->get_logger(),
-      "closeGripper: code %d (contact stop?), continuing",
-      static_cast<int>(result.val));
+      "closeGripper: action call failed, continuing to verify");
   }
   return true;
 }
@@ -817,6 +1388,53 @@ bool cw2::moveArmCartesian(
   if (exec_rc != moveit::core::MoveItErrorCode::SUCCESS) {
     RCLCPP_ERROR(node_->get_logger(),
       "moveArmCartesian: exec failed (%d)",
+      static_cast<int>(exec_rc.val));
+    return false;
+  }
+  return true;
+}
+
+
+bool cw2::moveArmCartesianConstrained(
+  const std::vector<geometry_msgs::msg::Pose> & waypoints,
+  const moveit_msgs::msg::Constraints & path_constraints,
+  double eef_step,
+  double jump_threshold,
+  bool retry_unconstrained)
+{
+  // computeCartesianPath in MoveIt 2 Humble has an overload that takes
+  // a Constraints message. Each IK checkpoint along the linear EE path
+  // is rejected unless it satisfies the constraints. This pins lateral
+  // EE drift during the final descent (the failure mode where the
+  // outer finger clips the basket wall on mid-large noughts because IK
+  // chooses joint solutions whose EE drifts ~5-10 mm sideways from the
+  // planned column).
+  moveit_msgs::msg::RobotTrajectory trajectory;
+  double fraction = arm_group_->computeCartesianPath(
+    waypoints, eef_step, jump_threshold, trajectory,
+    path_constraints, /*avoid_collisions=*/true);
+
+  bool ok = (fraction >= 0.9);
+  if (!ok) {
+    RCLCPP_WARN(node_->get_logger(),
+      "moveArmCartesianConstrained: constrained compute only %.1f%%, "
+      "%s.",
+      fraction * 100.0,
+      retry_unconstrained ? "retrying without constraint"
+                          : "no retry requested");
+    if (!retry_unconstrained) return false;
+    // Retry unconstrained so the descent still happens. The verify
+    // step downstream of the descent catches any resulting bad grip.
+    return moveArmCartesian(waypoints, eef_step, jump_threshold,
+                            /*allow_fallback=*/false);
+  }
+
+  moveit::planning_interface::MoveGroupInterface::Plan plan;
+  plan.trajectory_ = trajectory;
+  auto exec_rc = arm_group_->execute(plan);
+  if (exec_rc != moveit::core::MoveItErrorCode::SUCCESS) {
+    RCLCPP_ERROR(node_->get_logger(),
+      "moveArmCartesianConstrained: exec failed (%d)",
       static_cast<int>(exec_rc.val));
     return false;
   }
@@ -1025,7 +1643,7 @@ void cw2::removeTileCollision()
 }
 
 
-void cw2::addBasketCollision(const geometry_msgs::msg::Point & goal)
+bool cw2::addBasketCollision(const geometry_msgs::msg::Point & goal)
 {
   // Basket geometry from cw2_world_spawner/models/basket/model.sdf:
   //   - base 350 x 350 x 9 mm at model origin
@@ -1084,36 +1702,53 @@ void cw2::addBasketCollision(const geometry_msgs::msg::Point & goal)
   add_wall("basket_wall_ypos", goal.x, goal.y + inset, wall_l, wall_t);
   add_wall("basket_wall_yneg", goal.x, goal.y - inset, wall_l, wall_t);
 
-  // Yield + verify. Earlier evidence: the prior code used
-  // applyCollisionObjects(vector) and 100 ms wasn't enough - the
-  // walls weren't actually in the scene by the time the next plan()
-  // request ran (warning at task end:
-  //   "Tried to remove world object 'basket_wall_xpos', but it does
-  //    not exist in this scene")
-  // So we wait longer and then poll getKnownObjectNames() until the
-  // walls show up (or 1 s timeout).
+  // Yield + verify. Lambda factored out so we can retry the add
+  // and re-verify on first failure.
   using namespace std::chrono;
-  std::this_thread::sleep_for(milliseconds(200));
-  const auto deadline = steady_clock::now() + milliseconds(1000);
-  while (steady_clock::now() < deadline) {
-    const auto known = planning_scene_interface_.getKnownObjectNames();
-    int found = 0;
-    for (const auto & n : known) {
-      if (n == "basket_wall_xpos" || n == "basket_wall_xneg" ||
-          n == "basket_wall_ypos" || n == "basket_wall_yneg") {
-        ++found;
+  auto verify_walls = [&](milliseconds timeout) -> bool {
+    const auto deadline = steady_clock::now() + timeout;
+    while (steady_clock::now() < deadline) {
+      const auto known = planning_scene_interface_.getKnownObjectNames();
+      int found = 0;
+      for (const auto & n : known) {
+        if (n == "basket_wall_xpos" || n == "basket_wall_xneg" ||
+            n == "basket_wall_ypos" || n == "basket_wall_yneg") {
+          ++found;
+        }
       }
+      if (found == 4) return true;
+      std::this_thread::sleep_for(milliseconds(50));
     }
-    if (found == 4) {
-      RCLCPP_INFO(node_->get_logger(),
-        "addBasketCollision: all 4 basket walls present in planning scene");
-      return;
-    }
-    std::this_thread::sleep_for(milliseconds(50));
+    return false;
+  };
+
+  std::this_thread::sleep_for(milliseconds(200));
+  if (verify_walls(milliseconds(3000))) {
+    RCLCPP_INFO(node_->get_logger(),
+      "addBasketCollision: all 4 basket walls present in planning scene");
+    return true;
   }
+
+  // First attempt timed out. Re-send the walls (the messages may
+  // have been dropped or the planning_scene_monitor was busy) and
+  // give it more time.
   RCLCPP_WARN(node_->get_logger(),
-    "addBasketCollision: basket walls did not appear within 1 s; "
-    "subsequent plans may not avoid the basket");
+    "addBasketCollision: walls not in scene after 3 s; resending");
+  add_wall("basket_wall_xpos", goal.x + inset, goal.y, wall_t, wall_l);
+  add_wall("basket_wall_xneg", goal.x - inset, goal.y, wall_t, wall_l);
+  add_wall("basket_wall_ypos", goal.x, goal.y + inset, wall_l, wall_t);
+  add_wall("basket_wall_yneg", goal.x, goal.y - inset, wall_l, wall_t);
+  std::this_thread::sleep_for(milliseconds(200));
+  if (verify_walls(milliseconds(3000))) {
+    RCLCPP_INFO(node_->get_logger(),
+      "addBasketCollision: walls present after resend retry");
+    return true;
+  }
+
+  RCLCPP_ERROR(node_->get_logger(),
+    "addBasketCollision: walls STILL missing after resend; "
+    "returning failure so caller can abort.");
+  return false;
 }
 
 
